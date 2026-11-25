@@ -16,7 +16,7 @@ from ai_workflow.agent_builder import build_agent
 CASE_ID = "US20240012345A1"      # default; pass another id on the command line to override
 
 
-async def main(patent_id: str = CASE_ID) -> dict:
+async def parent_patent_info_fetching(patent_id: str = CASE_ID) -> dict:
     with contextlib.redirect_stdout(sys.stderr):        # model-loading messages must not pollute the JSON
         agent = build_agent()
     agent.log = lambda _: None                          # silence "step 1: model called ..."
@@ -30,4 +30,4 @@ async def main(patent_id: str = CASE_ID) -> dict:
 
 
 if __name__ == "__main__":
-    asyncio.run(main(sys.argv[1] if len(sys.argv) > 1 else CASE_ID))
+    asyncio.run(parent_patent_info_fetching(sys.argv[1] if len(sys.argv) > 1 else CASE_ID))
