@@ -1,6 +1,6 @@
 {
   "patent_id": "US1234567",
-  "fetched_at": "2026-11-20T12:50:16.587148+00:00",
+  "fetched_at": "2026-11-25T05:55:41.259101+00:00",
   "sources": {
     "uspto": null,
     "google_patents": {
@@ -32,7 +32,7 @@
       },
       "free_patents_online": {
         "details_found": false,
-        "error": "HTTPError: 403 Client Error: Forbidden for url: https://www.freepatentsonline.com/result.html?sort=relevance&srch=top&query_txt=US1234567"
+        "error": "Free Patents Online returned no patent details."
       }
     },
     "message": "Patent details were returned by at least one source."
