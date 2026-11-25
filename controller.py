@@ -5,7 +5,9 @@ import os
 import threading
 from datetime import datetime as dt
 
-DB_FILE = "data1.json"
+from main import *   # Jinsy's function
+
+DB_FILE = "data.json"
 _LOCK = threading.RLock()
 
 # Default data
@@ -72,28 +74,9 @@ def create_patent(data: dict, user_id: str) -> dict:
 
 
 # ---------------- Fetch by ID (runs inside the thread) ----------------
-# Replace the body with the real USPTO -> Google -> FPO logic (Jinsy's function).
 def fetch_patent_by_id(app, patent_id: str, user_id: str):
-    with app.app_context():
-        USERS[user_id]["fetching_patents"].append(patent_id)
-        try:
-            time.sleep(1)  # pretend we call USPTO / Google Patents
-            with _LOCK:
-                PATENTS[patent_id] = {
-                    "_id": patent_id,
-                    "title": f"Patent {patent_id}",
-                    "created_by": user_id,
-                    "source": "uspto",
-                    "claims": {"0": {"text": "A device comprising..."}},
-                    "analysis_status": "not_started",
-                }
-            print(f"LOG: fetched {patent_id} for {user_id}", flush=True)
-        except Exception as e:
-            USERS[user_id]["error_patents"].append(patent_id)
-            print(f"ERROR: fetch failed {patent_id}: {e}", flush=True)
-        finally:
-            USERS[user_id]["fetching_patents"].remove(patent_id)
-            save()
+    """Worker that runs inside the thread. Calls Jinsy's function."""
+    parent_patent_info_fetching(app, patent_id, user_id)
 
 
 def start_fetch_thread(app, patent_id: str, user_id: str):
