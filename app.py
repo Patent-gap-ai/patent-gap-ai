@@ -1,173 +1,113 @@
-import os
-import threading
-from flask import Flask, request, jsonify, session
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-from models.cases import *
-from models.users import *
-from env_controller import *
-from controller import *
+import controller as c
 
 app = Flask(__name__)
 CORS(app, origins="*")
-app.secret_key = os.environ.get('SECRET_KEY', 'your-secret-key-here')
+
+
+def _blank(v) -> bool:
+    """True for None / '' / whitespace / 'null' / 'none' / 'undefined'."""
+    return v is None or str(v).strip().lower() in ("", "null", "none", "undefined")
 
 
 def get_user_id():
-    """
-    Get user_id from X-User-ID header or session.
-    Returns None if not found.
-    """
-    # First check header
-    user_id = request.headers.get('X-User-ID')
-    if user_id:
-        return user_id
+    """User id from X-User-ID header, else JSON body 'userId'."""
+    uid = request.headers.get("X-User-ID")
+    if _blank(uid):
+        uid = (request.get_json(silent=True) or {}).get("userId")
+    return uid
+
+
+# ---------------- 1. FETCH PATENT BY ID ----------------
+@app.route("/api/fetch-patent-by-id", methods=["POST"])
+def fetch_patent_by_id():
+    data = request.get_json(silent=True) or {}
+    user_id = get_user_id()
+    patent_id = data.get("patentId")
+
+    if _blank(user_id):
+        return jsonify({"success": False, "message": "Invalid User ID"}), 409
+    if _blank(patent_id):
+        return jsonify({"success": False, "message": "Invalid Patent ID"}), 409
+    user_id = str(user_id).strip()
+    patent_id = str(patent_id).strip().upper()
+
+    if not c.user_exists(user_id):
+        return jsonify({"success": False, "message": "Unauthorized call"}), 401
+
+    if c.patent_exists(patent_id):
+        return jsonify({"success": False, "message": "Patent already exists"}), 409
+
+    started, err = c.start_fetch_thread(app, patent_id, user_id)
+
+    if started:
+        return jsonify({"success": True,
+                        "message": f"Fetching patent {patent_id} has begun"}), 200
+    print(f"ERROR: thread start failed: {err}")
+    return jsonify({"success": False,
+                    "message": "Some internal error occured. Please try again"}), 500
+
+
+# ---------------- 2. CREATE USER ----------------
+@app.route("/api/create-user", methods=["POST"])
+def create_user():
+    data = request.get_json(silent=True) or {}
+    for field, msg in (("email", "Email is required"),
+                       ("password", "Password is required"),
+                       ("full_name", "Name is required")):
+        if _blank(data.get(field)):
+            return jsonify({"success": False, "message": msg}), 400
+    result = c.create_user(data)
+    return jsonify(result), (200 if result["success"] else 400)
+
+
+# ---------------- 3. CREATE PATENT ----------------
+@app.route("/api/create-patent", methods=["POST"])
+def create_patent():
+    user_id = get_user_id()
+    if _blank(user_id):
+        return jsonify({"success": False, "message": "User ID is required"}), 400
+    if not c.user_exists(str(user_id).strip()):
+        return jsonify({"success": False, "message": "Unauthorized call"}), 401
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"success": False, "message": "No data provided"}), 400
+    result = c.create_patent(data, str(user_id).strip())
+    return jsonify(result), (200 if result["success"] else 400)
+
+
+# ---------------- 4. START AI ANALYSIS ----------------
+@app.route("/api/start-ai-analysis/<case_id>", methods=["POST"])
+def start_ai_analysis(case_id):
+    user_id = get_user_id()
+    if _blank(user_id):
+        return jsonify({"success": False, "message": "Invalid User ID"}), 409
+    if not c.user_exists(str(user_id).strip()):
+        return jsonify({"success": False, "message": "Unauthorized call"}), 401
+    case_id = case_id.strip().upper()
+    case = c.PATENTS.get(case_id)
+    if case is None:
+        return jsonify({"success": False, "message": "Case not found"}), 404
+    if case.get("analysis_status") == "running":
+        return jsonify({"success": False, "message": "Analysis already running"}), 409
+
+    started, err = c.start_analysis_thread(app, case_id)
+    if started:
+        return jsonify({"success": True,
+                        "message": f"AI analysis for {case_id} has begun"}), 200
+    return jsonify({"success": False,
+                    "message": "Some internal error occured. Please try again"}), 500
+
+
+@app.route("/api/case-status/<case_id>")
+def case_status(case_id):
+    case = c.PATENTS.get(case_id.strip().upper())
+    return (jsonify({"success": True, "case": case}), 200) if case else \
+           (jsonify({"success": False, "message": "Case not found"}), 404)
+
+
+if __name__ == "__main__":
+    app.run(port=5000, debug=True)
     
-    # Fallback to session for backward compatibility
-    if 'user_id' in session:
-        return session['user_id']
-    
-    return None
-
-
-@app.route('/api/fetch-patent-from-uspto', methods=['POST'])
-def fetch_patent_from_uspto():
-  """
-  Fetch a patent from the US Patent Office and create a case
-  ---
-  tags:
-    - Patents
-  summary: Fetch patent from USPTO
-  description: |
-    Fetches patent data from the US Patent and Trademark Office (USPTO) using the provided patent ID.
-    The patent data is then normalized and automatically created as a case in the system.
-    The case will be monitored for similarity analysis.
-  consumes:
-    - application/json
-  produces:
-    - application/json
-  security:
-    - session: []
-  parameters:
-    - in: body
-      name: patent_request
-      description: Patent ID to fetch from USPTO
-      required: true
-      schema:
-        type: object
-        required:
-          - patentId
-        properties:
-          patentId:
-            type: string
-            description: The USPTO patent number/ID to fetch
-            example: "US12345678"
-  responses:
-    200:
-      description: Patent fetched successfully and case created
-      schema:
-        type: object
-        properties:
-          success:
-            type: boolean
-            example: true
-          message:
-            type: string
-            example: "Patent has been fetched successfully. This case is now being monitored for similarity."
-          case_id:
-            type: string
-            description: The ID of the created case
-            example: "case_12345"
-    400:
-      description: Bad request - missing or invalid patent ID, or failed to fetch/normalize patent data
-      schema:
-        type: object
-        properties:
-          success:
-            type: boolean
-            example: false
-          message:
-            type: string
-            example: "Patent ID is required"
-    500:
-      description: Internal server error during patent data processing
-      schema:
-        type: object
-        properties:
-          success:
-            type: boolean
-            example: false
-          message:
-            type: string
-            example: "Error normalizing patent data: [error details]"
-  """
-  user_id = get_user_id()
-  if not user_id:
-    print('\nUser ID is not in session')
-    return jsonify({'success': False, 'message': 'User ID is not in session'}), 400
-  print(f'LOG: {user_id} Import Patent from USPTO')
-  
-  data = request.get_json()
-  if data is None:
-    print('\nNo Data provided')
-    return jsonify({'success': False, 'message': 'No data provided'}), 400
-  if 'patentId' not in data.keys():
-    print('\nPatent ID is not Provided')
-    return jsonify({'success': False, 'message': 'Patent ID is not provided'}), 400
-  patent_id = data.get('patentId')
-  if patent_id is None or patent_id == '':
-    print('\nPatent ID is not valid')
-    return jsonify({'success': False, 'message': 'Patent ID is not valid'}), 400
-
-  # Check if the patent already exists
-  if caseAlreadyExists(patent_id, user_id):
-    return jsonify({'success': False, 'message': 'Patent already exists in your portfolio'}), 400
-  
-  user_data = get_user_profile(user_id, show_password=False) 
-  fetching_patents = user_data.get('fetching_patents', [])
-  patent_id = str(patent_id).strip().upper()
-  if patent_id in fetching_patents:
-    return jsonify({
-        'success': False,
-        'message': f'Patent ID {patent_id} is already being fetched by this user.',
-        'case_id': patent_id
-    }), 409
-
-  print(f'\nFetching patent of ID {patent_id} from USPTO (key: {getEnvKey("uspto")}): {json.dumps(data, indent=4)}')
-
-  update_user_fetching_patents(
-    user_id=user_id, 
-    fetching_patents=[patent_id], 
-    error_patents=[], 
-    replace=True
-    )
-  thread = threading.Thread(
-    target=fetchById,
-    name=f'{patent_id}-{user_id}',
-    args=(app, patent_id, user_id),
-    daemon=True,
-  )
-  thread.start()
-  responseBody = {
-    'success': True, 
-    'message': 'Patent data import started', 
-    'case_id': patent_id
-  }
-  return jsonify(responseBody), 200
-
-
-@app.route('/api/check-fetching-thread-status/<patent_id>', methods=['GET'])
-def check_fetching_thread_status(patent_id):
-  user_id = get_user_id()
-  if not user_id:
-    print('\nUser ID is not in session')
-    return jsonify({'success': False, 'message': 'User ID is not in session'}), 400
-  print(f'LOG: {user_id} Checking Fetching Thread Status for Patent: {patent_id}')
-
-  status, message = check_thread_status(f'{patent_id}-{user_id}')
-  status_code = 200 if status else 400
-  return jsonify({'success': status, 'message': message}), status_code
-
-
-if __name__ == '__main__':
-    app.run(port=int(os.environ.get('PORT', 5000)))
