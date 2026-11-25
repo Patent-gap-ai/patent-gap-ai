@@ -5,7 +5,7 @@ import os
 import threading
 from datetime import datetime as dt
 
-from main import *   # Jinsy's function
+from main import parent_patent_info_fetching   # Jinsy's function
 
 DB_FILE = "data.json"
 _LOCK = threading.RLock()
@@ -75,8 +75,48 @@ def create_patent(data: dict, user_id: str) -> dict:
 
 # ---------------- Fetch by ID (runs inside the thread) ----------------
 def fetch_patent_by_id(app, patent_id: str, user_id: str):
+    
     """Worker that runs inside the thread. Calls Jinsy's function."""
-    parent_patent_info_fetching(app, patent_id, user_id)
+    patent_id = patent_id.strip().upper()
+
+    # mark as fetching
+    with _LOCK:
+        user = USERS.get(user_id)
+        if user and patent_id not in user["fetching_patents"]:
+            user["fetching_patents"].append(patent_id)
+        save()
+
+    result, error = None, None
+    try:
+        result = parent_patent_info_fetching(app, patent_id, user_id)
+        if result.get("status") == "ERROR":
+            error = result.get("error") or "Fetch tool failed"
+        elif not result.get("validation", {}).get("valid", False):
+            error = "No usable patent details found"
+    except Exception as e:
+        error = str(e)
+
+    # store the outcome
+    with _LOCK:
+        patent = PATENTS.setdefault(patent_id, {
+            "_id": patent_id,
+            "created_by": user_id,
+            "created_date": dt.now().strftime("%Y-%m-%d"),
+            "analysis_status": "not_started",
+        })
+        if error is None:
+            patent["fetch_status"] = "fetched"
+            patent["fetched_data"] = result
+            patent.pop("fetch_error", None)
+        else:
+            patent["fetch_status"] = "error"
+            patent["fetch_error"] = error
+            if user and patent_id not in user["error_patents"]:
+                user["error_patents"].append(patent_id)
+
+        if user and patent_id in user["fetching_patents"]:
+            user["fetching_patents"].remove(patent_id)
+        save()
 
 
 def start_fetch_thread(app, patent_id: str, user_id: str):

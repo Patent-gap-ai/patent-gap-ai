@@ -1,3 +1,5 @@
+"""Fixed prompts used by the patent information agent."""
+from __future__ import annotations
 
 
 # ===========================================================================
@@ -19,8 +21,6 @@ TOOL_AGENT_USER_PROMPT = "Fetch the patent with id {patent_id}."
 
 
 
-"""Fixed prompts used by the patent information agent."""
-from __future__ import annotations
 
 PATENT_AGENT_SYSTEM_PROMPT = """
 ROLE: Patent Information Validation Agent

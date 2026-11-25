@@ -1,10 +1,3 @@
-"""Fetch one patent by id through the model-driven MCP tool loop and print ONLY the JSON.
-
-    python main.py [patent_id]
-
-The JSON is printed to the console and also saved to output/<patent_id>.json.
-(The three-agent committee is commented out in ai_workflow/agent_builder.py for now.)
-"""
 import asyncio
 import contextlib
 import json
@@ -13,20 +6,17 @@ from pathlib import Path
 
 from ai_workflow.agent_builder import build_agent
 
-#CASE_ID = "US20240012345A1"      # default; pass another id on the command line to override
 
+def parent_patent_info_fetching(app, patent_id: str, user_id: str) -> dict:
+    patent_id = patent_id.strip().upper()
 
-async def parent_patent_info_fetching(patent_id: str) -> dict:
-    with contextlib.redirect_stdout(sys.stderr):        # model-loading messages must not pollute the JSON
+    with contextlib.redirect_stdout(sys.stderr):
         agent = build_agent()
-    agent.log = lambda _: None                          # silence "step 1: model called ..."
-    result = await agent.run(patent_id)
+    agent.log = lambda _: None
+    result = asyncio.run(agent.run(patent_id))
 
     out = Path("output") / f"{patent_id}.json"
     out.parent.mkdir(exist_ok=True)
     out.write_text(json.dumps(result, indent=2), encoding="utf-8")
-    print(json.dumps(result, indent=2))                 # the only console output
+    print(json.dumps(result, indent=2))
     return result
-
-
-
