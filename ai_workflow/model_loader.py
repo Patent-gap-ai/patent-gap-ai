@@ -234,6 +234,35 @@ class LoadedModel:
         )
         return response["message"]["content"]
 
+    def chat_message(self, messages: list, tools: Optional[list] = None, **kwargs) -> dict:
+        """
+        Like chat(), but return the whole assistant message so tool calls are not lost.
+        `tools` is a list of tool schemas: [{"type": "function", "function": {...}}].
+        Returns {"role": "assistant", "content": str,
+                 "tool_calls": [{"function": {"name": str, "arguments": dict}}]}  (tool_calls may be empty)
+        """
+        response = self.client.chat(
+            model=self.tag,
+            messages=messages,
+            tools=tools or None,
+            options={**self._options(), **kwargs.pop("options", {})},
+            keep_alive=LLM_RUNTIME["keep_alive"],
+            **kwargs,
+        )
+        return _plain_message(response["message"])
+
+
+def _plain_message(message) -> dict:
+    """Turn the Ollama SDK message object into a plain dict, so the agents do not depend on SDK types."""
+    def get(obj, key, default=None):
+        return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
+
+    calls = []
+    for call in get(message, "tool_calls") or []:
+        fn = get(call, "function")
+        calls.append({"function": {"name": get(fn, "name", ""), "arguments": dict(get(fn, "arguments") or {})}})
+    return {"role": "assistant", "content": get(message, "content") or "", "tool_calls": calls}
+
 
 def _installed_tags(client) -> set:
     """Return the set of model tags already downloaded in Ollama."""

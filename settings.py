@@ -154,3 +154,17 @@ LOCAL_LLM_MODELS = {
         "description": "Server-class model, needs a lot of memory.",
     },
 }
+
+# ---------------------------------------------------------------------------
+# 4. Patent committee (agents that review a patent claim)
+# ---------------------------------------------------------------------------
+#   model_key   : key from LOCAL_LLM_MODELS that the agents use
+#   max_rounds  : how many times a rejected agent output is fixed and re-run
+#   notes_chars : cap on team rules / confirmed facts copied into a prompt
+#   max_tool_steps : cap on model <-> tool round trips in the tool loop (stops endless tool calling)
+COMMITTEE = {
+    "model_key": "qwen2.5-1.5b",
+    "max_rounds": 2,
+    "notes_chars": 2000,
+    "max_tool_steps": 8,
+}

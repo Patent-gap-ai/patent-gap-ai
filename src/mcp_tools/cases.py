@@ -1,38 +1,30 @@
-"""Fetch a patent from USPTO, Google Patents and Free Patents Online.
+"""MCP server + tool functions.
 
-Saved as patent-gap-ai/src/models/cases.py:
+The FastMCP server object and the @mcp.tool() functions live here.
+mcp_tools/mcp.py only imports `mcp` from this file and runs it:  python -m mcp_tools.mcp
 
-    patent-gap-ai/
-        Sources/USPTO.py
-        web_scraper/google_patents.py
-        web_scraper/free_patents_online.py
-        src/envController.py
-        src/models/cases.py   <- this file
+Needs these folders from patent-gap-ai copied into the PROJECT ROOT (next to app.py / main.py):
+    Sources/USPTO.py
+    web_scraper/google_patents.py
+    web_scraper/free_patents_online.py
+    src/envController.py          (+ your .env file with the USPTO key)
 
-Run it from the project root:
-    python src/models/cases.py US1234567
-or as a module:
-    python -m src.models.cases US1234567
-
-The result is saved automatically to the project root:
-    results/<PATENT_ID>.json
+Never print() at module level or in the tool: stdout is the MCP channel. (The tool also
+redirects any stray print() from the fetchers to stderr, so they cannot break the protocol.)
 """
-
 from __future__ import annotations
 
-import argparse
+import contextlib
 import json
-import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import requests
+from mcp.server.fastmcp import FastMCP
 
-# This file lives in patent-gap-ai/src/models/, so the project root is two
-# levels up. Adding it to sys.path lets the imports below work however the
-# file is started (terminal, Run button, or python -m).
+# This file lives in <project>/mcp_tools/, so the project root is one level up.
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -42,8 +34,8 @@ from Sources.USPTO import USPTOPatentAPI, USPTOAPIError  # noqa: E402
 from web_scraper.google_patents import GooglePatents  # noqa: E402
 from web_scraper.free_patents_online import FreePatentsOnline  # noqa: E402
 
+mcp = FastMCP("Patent Case Tools")
 
-RESULTS_DIR = ROOT_DIR / "results"
 SOURCE_NAMES = ("uspto", "google_patents", "free_patents_online")
 
 SCRAPER_ERRORS = (
@@ -150,7 +142,7 @@ def validate_patent_results(
 
 
 # --------------------------------------------------------------------------
-# Orchestration and saving
+# Orchestration: fetch from all sources, then validate
 # --------------------------------------------------------------------------
 def fetch_patent_details(patent_id: str) -> dict[str, Any]:
     """Fetch a patent from all sources, then validate the results."""
@@ -182,37 +174,85 @@ def fetch_patent_details(patent_id: str) -> dict[str, Any]:
     }
 
 
-def save_results(result: dict[str, Any]) -> Path:
-    """Write the result to results/<PATENT_ID>.json and return the path."""
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", result["patent_id"])
-    output_path = RESULTS_DIR / f"{safe_id}.json"
-    output_path.write_text(
-        json.dumps(result, indent=2, default=str, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    return output_path
+# --------------------------------------------------------------------------
+# The MCP tool
+# --------------------------------------------------------------------------
+@mcp.tool()
+def fetch_by_id(patent_id: str) -> str:
+    """Fetch one patent by its id from USPTO, Google Patents and Free Patents Online,
+    validate the results, and return everything as a JSON string."""
+    try:
+        with contextlib.redirect_stdout(sys.stderr):      # stray print() in fetchers must not hit MCP stdout
+            result = fetch_patent_details(patent_id)
+        return json.dumps(result, default=str, ensure_ascii=False)
+    except Exception as exc:  # noqa: BLE001 - returned as JSON so the caller can read it
+        return json.dumps({"status": "ERROR", "patent_id": patent_id,
+                           "error": f"{type(exc).__name__}: {exc}"})
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Fetch patent details from USPTO, Google Patents, and FPO."
-    )
-    parser.add_argument("patent_id", help="Patent or application ID to look up")
-    args = parser.parse_args()
+# ---------------------------------------------------------------------------
+# Old hardcoded tools, kept for later. Not registered as MCP tools right now
+# (uncomment the @mcp.tool() line above a function to enable it).
+# ---------------------------------------------------------------------------
+# @mcp.tool()
+def get_reference_patent(patent_id: str = "US20240012345A1") -> str:
+    """Return the reference patent (the patent being protected) as a JSON string."""
+    patent = {
+        "patent_id": patent_id,
+        "title": "Wireless Power Transfer System",
+        "inventors": ["Alex Morgan", "Jamie Lee"],
+        "filing_date": "2023-06-15",
+        "publication_date": "2024-01-18",
+        "abstract": (
+            "A system for transferring electrical power wirelessly between "
+            "a transmitter and a receiver using resonant coupling."
+        ),
+        "claims": [
+            "A wireless power transfer system comprising: a power transmitter; and a power "
+            "receiver configured to receive power from the power transmitter.",
+            "The system of claim 1, wherein the receiver uses resonant coupling.",
+        ],
+    }
+    return json.dumps(patent)
+
+
+# @mcp.tool()
+def get_candidate_patent(patent_id: str = "US20240012345A1") -> str:
+    """Return the candidate patent/product (the one being compared) as a JSON string.
+    `patent_id` is the case id; the candidate has its own patent number."""
+    patent = {
+        "patent_id": "US20230099876A1",
+        "title": "Resonant Wireless Charging Pad",
+        "inventors": ["Sam Rivera"],
+        "filing_date": "2023-03-02",
+        "publication_date": "2023-09-28",
+        "abstract": (
+            "A charging pad with a transmitter coil that sends power to a receiver coil "
+            "in a phone through resonant coupling."
+        ),
+        "claims": [
+            "A charging pad comprising a transmitter coil that sends power wirelessly to a receiver coil.",
+            "The charging pad of claim 1, wherein the coils are tuned to the same resonant frequency.",
+        ],
+    }
+    return json.dumps(patent)
+
+
+# @mcp.tool()
+def validate_patent_information(patent_json: str) -> str:
+    """Validate that a patent JSON object contains the required fields."""
+    required_fields = ["patent_id", "title", "inventors", "filing_date", "abstract", "claims"]
 
     try:
-        result = fetch_patent_details(args.patent_id)
-    except ValueError as error:
-        parser.error(str(error))
+        patent: Any = json.loads(patent_json)
+    except json.JSONDecodeError as exc:
+        return json.dumps({"status": "FAILURE", "valid": False, "errors": [f"Invalid JSON: {exc.msg}"]})
 
-    output_path = save_results(result)
-    validation = result["validation"]
-    print(f"{validation['message']}")
-    print(f"Successful sources: {validation['successful_sources'] or 'none'}")
-    print(f"Saved results to: {output_path}")
-    return 0 if validation["valid"] else 1
+    if not isinstance(patent, dict):
+        return json.dumps({"status": "FAILURE", "valid": False,
+                           "errors": ["Patent information must be a JSON object."]})
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    missing_fields = [f for f in required_fields if f not in patent or patent[f] in (None, "", [])]
+    errors = [f"Missing or empty required field: {f}" for f in missing_fields]
+    return json.dumps({"status": "SUCCESS" if not errors else "FAILURE", "valid": not errors,
+                       "checked_fields": required_fields, "errors": errors})
