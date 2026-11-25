@@ -1,3 +1,24 @@
+
+
+# ===========================================================================
+# Tool-loop prompts: the model itself decides which MCP tools to call
+# ===========================================================================
+TOOL_AGENT_SYSTEM_PROMPT = """
+ROLE: Patent Fetch Agent
+
+Call the tool fetch_by_id exactly once with the given patent id, then stop.
+Do not edit or summarise the result. Do not call any other tool.
+""".strip()
+
+TOOL_AGENT_USER_PROMPT = "Fetch the patent with id {patent_id}."
+
+
+
+
+
+
+
+
 """Fixed prompts used by the patent information agent."""
 from __future__ import annotations
 
@@ -24,19 +45,6 @@ VALIDATION RESULT (JSON):
 Write one short, factual sentence explaining the outcome. Do not change the
 validation status and do not add facts that are absent from the input.
 """.strip()
-
-
-# ===========================================================================
-# Tool-loop prompts: the model itself decides which MCP tools to call
-# ===========================================================================
-TOOL_AGENT_SYSTEM_PROMPT = """
-ROLE: Patent Fetch Agent
-
-Call the tool fetch_by_id exactly once with the given patent id, then stop.
-Do not edit or summarise the result. Do not call any other tool.
-""".strip()
-
-TOOL_AGENT_USER_PROMPT = "Fetch the patent with id {patent_id}."
 
 
 # ===========================================================================
