@@ -101,11 +101,28 @@ def start_ai_analysis(case_id):
                     "message": "Some internal error occured. Please try again"}), 500
 
 
-@app.route("/api/case-status/<case_id>")
+@app.route("/api/case-status/<case_id>", methods=["GET"])
 def case_status(case_id):
-    case = c.PATENTS.get(case_id.strip().upper())
-    return (jsonify({"success": True, "case": case}), 200) if case else \
-           (jsonify({"success": False, "message": "Case not found"}), 404)
+    case_id = case_id.strip().upper()
+    case = c.PATENTS.get(case_id)
+    if not case:
+        return jsonify({"success": False, "message": "Case not found"}), 404
+
+    creator = c.USERS.get(case.get("created_by"), {})
+    is_fetching = any(case_id in u.get("fetching_patents", []) for u in c.USERS.values())
+
+    return jsonify({
+        "success": True,
+        "case_id": case_id,
+        "analysis_status": case.get("analysis_status"),
+        "is_fetching": is_fetching,
+        "created_by": {
+            "user_id": creator.get("_id"),
+            "email": creator.get("email"),
+            "full_name": creator.get("full_name"),
+        },
+        "case": case,
+    }), 200
 
 
 if __name__ == "__main__":
