@@ -1,0 +1,28 @@
+{
+  "patent_id": "US99999999",
+  "fetched_at": "2026-11-25T06:20:43.307895+00:00",
+  "sources": {
+    "uspto": null,
+    "google_patents": null,
+    "free_patents_online": null
+  },
+  "validation": {
+    "valid": false,
+    "successful_sources": [],
+    "source_status": {
+      "uspto": {
+        "details_found": false,
+        "error": "API key is required to use the USPTO Patent File Wrapper API.\nTo obtain an API key:\n1. Create a USPTO.gov account at https://www.uspto.gov/\n2. Log in to the API Key Manager at https://account.uspto.gov/api-manager/\n3. Request an API key for the Patent File Wrapper API service\nThen initialize with: USPTOPatentAPI(api_key='your-api-key')"
+      },
+      "google_patents": {
+        "details_found": false,
+        "error": "Google Patents returned no patent details."
+      },
+      "free_patents_online": {
+        "details_found": false,
+        "error": "Free Patents Online returned no patent details."
+      }
+    },
+    "message": "No source returned usable patent details."
+  }
+}
