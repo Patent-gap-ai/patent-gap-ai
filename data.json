@@ -10,14 +10,14 @@
   },
   "patents": {
     "US20240012345A1": {
+      "analysis_status": "not_started",
+      "created_date": "2026-11-27",
       "_id": "US20240012345A1",
       "created_by": "user1",
-      "created_date": "2026-11-25",
-      "analysis_status": "not_started",
       "fetch_status": "fetched",
       "fetched_data": {
         "patent_id": "US20240012345A1",
-        "fetched_at": "2026-11-25T12:42:38.826633+00:00",
+        "fetched_at": "2026-11-27T11:57:34.575317+00:00",
         "sources": {
           "uspto": null,
           "google_patents": {
@@ -55,6 +55,20 @@
           "message": "Patent details were returned by at least one source."
         }
       }
+    }
+  },
+  "alerts": {
+    "1795780654631": {
+      "_id": "1795780654631",
+      "title": "Case US20240012345A1 created successfully",
+      "description": "Fetched from: google_patents. Saved to the database.",
+      "triggered_by": "US20240012345A1",
+      "triggered_at": "2026-11-27",
+      "alert_users": [
+        "user1"
+      ],
+      "opened_receipts": [],
+      "sent_receipts": []
     }
   }
 }

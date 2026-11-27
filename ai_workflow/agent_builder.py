@@ -51,6 +51,9 @@ from ai_workflow.static_prompts import TOOL_AGENT_SYSTEM_PROMPT, TOOL_AGENT_USER
 # from ai_workflow.static_prompts import SCHEMAS, SYSTEM_PROMPTS, USER_BUILDERS   # committee (commented out for now)
 from settings import COMMITTEE
 
+# MCP tools that only the code may call (the model never sees them)
+CODE_ONLY_TOOLS = {"create_patent"}
+
 
 # class AgentOutputError(RuntimeError):
 #     """An agent's reply was not usable (not JSON, wrong shape, empty)."""
@@ -156,13 +159,13 @@ class PatentAgent:
         except Exception as exc:  # noqa: BLE001 - fed back to the model instead of crashing the run
             return f"ERROR: {type(exc).__name__}: {exc}"
 
-    async def _run_tool_loop(self, patent_id: str) -> dict:
+    async def _run_tool_loop(self, patent_id: str, user_id: str) -> dict:
         project_root = Path(__file__).resolve().parents[1]
         server_params = StdioServerParameters(
             command=sys.executable,
             args=["-m", "src.mcp_tools.mcp"],         # server lives in mcp_tools/mcp.py
             cwd=str(project_root),                 # so `mcp_tools` and `settings` can be imported
-            env=dict(os.environ),                  # pass API keys / config through to the server
+            env={**os.environ, "PATENT_GAP_USER_ID": str(user_id)},   # API keys + the owner of the new patent
         )
         trace: list[dict] = []
         final_text = ""
@@ -172,7 +175,9 @@ class PatentAgent:
                 await session.initialize()                                           # 1
                 listed = (await session.list_tools()).tools                          # 2
                 schemas = {t.name: t.inputSchema for t in listed}
-                tools = self._ollama_tools(listed)
+                # create_patent is called by this code, not by the model (a small model may skip it or
+                # invent arguments), so it is kept off the model's tool list.
+                tools = self._ollama_tools([t for t in listed if t.name not in CODE_ONLY_TOOLS])
                 messages: list[dict] = [                                             # 3
                     {"role": "system", "content": TOOL_AGENT_SYSTEM_PROMPT},
                     {"role": "user", "content": TOOL_AGENT_USER_PROMPT.format(patent_id=patent_id)},
@@ -202,7 +207,20 @@ class PatentAgent:
                         capped = False
                         break
                     # 9: loop again, unless the for-loop runs out of steps (the cap)
-        # 10: the session is closed here (end of the two `async with` blocks)
+
+                # 9b: the model has called fetch_by_id. Now THIS CODE calls the create_patent tool on the same
+                # open session. The tool itself checks that the fetch was valid, inserts the case into the
+                # database, and records an alert for success or failure, so it is called after every fetch.
+                fetched = next((x for x in reversed(trace)
+                                if x["tool"] == "fetch_by_id" and not x["error"]), None)
+                if fetched is not None:
+                    data = self._json_object(fetched["result"]) or {}
+                    args = {"patent_id": data.get("patent_id") or patent_id}
+                    self.log("  inserting the case with create_patent")
+                    text = await self._call_tool(session, schemas, "create_patent", args)
+                    trace.append({"step": steps, "tool": "create_patent", "arguments": args,
+                                  "result": text, "error": text.startswith("ERROR:")})
+        # 10: the session is closed here (end of the two `async with` blocks): the MCP server process stops
         return {"final_text": final_text, "trace": trace, "steps": steps, "capped": capped}
 
     # -- read the trace: what was really fetched and validated ----------------
@@ -399,10 +417,11 @@ class PatentAgent:
 #
 
     # -- the whole flow --------------------------------------------------------
-    async def run(self, patent_id: str) -> dict:
-        """Let the model call fetch_by_id, then return exactly the JSON the tool returned.
-        The output is taken from the tool trace, not from the model's words."""
-        loop = await self._run_tool_loop(patent_id)
+    async def run(self, patent_id: str, user_id: str) -> dict:
+        """Let the model call fetch_by_id, save the result with create_patent, and return the fetched JSON
+        plus a "db_insert" entry with the outcome of the save. The output is taken from the tool trace,
+        not from the model's words."""
+        loop = await self._run_tool_loop(patent_id, user_id)
         calls = [t for t in loop["trace"] if t["tool"] == "fetch_by_id" and not t["error"]]
         if not calls:
             raise RuntimeError("the model did not call fetch_by_id (step cap reached: "
@@ -410,6 +429,13 @@ class PatentAgent:
         data = self._json_object(calls[-1]["result"])
         if data is None:
             raise RuntimeError("fetch_by_id did not return a JSON object")
+
+        saves = [t for t in loop["trace"] if t["tool"] == "create_patent"]
+        if not saves:      # should not happen: the code calls create_patent after every fetch
+            data["db_insert"] = {"success": False, "message": "Case was not created: create_patent was not called."}
+        else:
+            data["db_insert"] = self._json_object(saves[-1]["result"]) or {
+                "success": False, "message": saves[-1]["result"][:300]}
         return data
 
 

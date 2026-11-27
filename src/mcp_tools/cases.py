@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,11 +31,20 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from src.envController import getEnvKey  # noqa: E402
+from src.dbControllers.caseControllers import insert_case  # noqa: E402
+from src.dbControllers.alertControllers import insert_case_alert  # noqa: E402
 from Sources.USPTO import USPTOPatentAPI, USPTOAPIError  # noqa: E402
 from web_scraper.google_patents import GooglePatents  # noqa: E402
 from web_scraper.free_patents_online import FreePatentsOnline  # noqa: E402
 
 mcp = FastMCP("Patent Case Tools")
+
+# Who owns a new case comes from the environment variable PATENT_GAP_USER_ID, which the Python code that
+# starts this server (agent_builder.py) sets. It never comes from the model, so the model cannot pick the user.
+
+# The last fetch of each patent (good or failed), kept in THIS server process.
+# create_patent reads it from here, so the model never has to copy a huge JSON by hand.
+_LAST_FETCH: dict[str, dict[str, Any]] = {}
 
 SOURCE_NAMES = ("uspto", "google_patents", "free_patents_online")
 
@@ -184,10 +194,58 @@ def fetch_by_id(patent_id: str) -> str:
     try:
         with contextlib.redirect_stdout(sys.stderr):      # stray print() in fetchers must not hit MCP stdout
             result = fetch_patent_details(patent_id)
+        _LAST_FETCH[result["patent_id"]] = result         # remembered for create_patent
         return json.dumps(result, default=str, ensure_ascii=False)
     except Exception as exc:  # noqa: BLE001 - returned as JSON so the caller can read it
-        return json.dumps({"status": "ERROR", "patent_id": patent_id,
-                           "error": f"{type(exc).__name__}: {exc}"})
+        failed = {"status": "ERROR", "patent_id": patent_id, "error": f"{type(exc).__name__}: {exc}"}
+        _LAST_FETCH[(patent_id or "").strip().upper()] = failed       # create_patent reports this reason
+        return json.dumps(failed)
+
+
+@mcp.tool()
+def create_patent(patent_id: str) -> str:
+    """Insert the patent that fetch_by_id just returned into the database as a new case, then save the
+    outcome (success or failure) as an alert. Call it only after fetch_by_id for the same patent id.
+    Returns a JSON string with "success" (true/false) and a "message"."""
+    key = (patent_id or "").strip().upper()
+    label = key or "unknown"
+    user_id = os.environ.get("PATENT_GAP_USER_ID", "").strip()
+    success, message, sources = False, "", ""
+
+    # 1) insert the case into the database
+    try:
+        fetched = _LAST_FETCH.get(key)
+        if fetched is None:
+            message = f"Case {label} was not created: nothing was fetched yet, call fetch_by_id first."
+        elif fetched.get("status") == "ERROR":
+            message = f"Case {label} was not created: the fetch failed ({fetched.get('error')})."
+        elif not fetched.get("validation", {}).get("valid", False):
+            message = f"Case {label} was not created: no source returned usable patent details."
+        elif not user_id:
+            message = f"Case {label} was not created: no user id was given to the MCP server."
+        else:
+            outcome = insert_case({
+                "_id": key,
+                "created_by": user_id,
+                "fetch_status": "fetched",
+                "fetched_data": fetched,
+            })
+            success, message = outcome["success"], outcome["message"]    # "Case X created successfully"
+            sources = ", ".join(fetched["validation"].get("successful_sources", []))
+    except Exception as exc:  # noqa: BLE001 - a database error is reported, never crashes the server
+        message = f"Case {label} was not created: {type(exc).__name__}: {exc}"
+
+    # 2) insert an alert with the result, whether it worked or not
+    alert_id, alert_error = None, None
+    try:
+        alert_id = insert_case_alert(label, user_id, success, message, sources)
+    except Exception as exc:  # noqa: BLE001
+        alert_error = f"{type(exc).__name__}: {exc}"
+
+    reply: dict[str, Any] = {"success": success, "message": message, "case_id": key, "alert_id": alert_id}
+    if alert_error:
+        reply["alert_error"] = alert_error
+    return json.dumps(reply)
 
 
 # ---------------------------------------------------------------------------

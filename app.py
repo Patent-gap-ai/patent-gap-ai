@@ -87,7 +87,7 @@ def start_ai_analysis(case_id):
     if not c.user_exists(str(user_id).strip()):
         return jsonify({"success": False, "message": "Unauthorized call"}), 401
     case_id = case_id.strip().upper()
-    case = c.PATENTS.get(case_id)
+    case = c.get_patent(case_id)
     if case is None:
         return jsonify({"success": False, "message": "Case not found"}), 404
     if case.get("analysis_status") == "running":
@@ -104,7 +104,7 @@ def start_ai_analysis(case_id):
 @app.route("/api/case-status/<case_id>", methods=["GET"])
 def case_status(case_id):
     case_id = case_id.strip().upper()
-    case = c.PATENTS.get(case_id)
+    case = c.get_patent(case_id)
     if not case:
         return jsonify({"success": False, "message": "Case not found"}), 404
 

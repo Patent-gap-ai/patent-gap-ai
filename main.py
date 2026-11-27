@@ -13,7 +13,7 @@ def parent_patent_info_fetching(app, patent_id: str, user_id: str) -> dict:
     with contextlib.redirect_stdout(sys.stderr):
         agent = build_agent()
     agent.log = lambda _: None
-    result = asyncio.run(agent.run(patent_id))
+    result = asyncio.run(agent.run(patent_id, user_id))   # fetch + create_patent (see agent_builder)
 
     out = Path("output") / f"{patent_id}.json"
     out.parent.mkdir(exist_ok=True)

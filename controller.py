@@ -1,33 +1,31 @@
+import copy
 import time
 import uuid
-import json
-import os
 import threading
 from datetime import datetime as dt
 
 from main import parent_patent_info_fetching   # Jinsy's function
+from memory import mongoDb as store
+from src.dbControllers.caseControllers import case_exists, get_case, insert_case, update_case
+from src.dbControllers.alertControllers import insert_case_alert
 
-DB_FILE = "data.json"
 _LOCK = threading.RLock()
 
-# Default data
+# Users still live in memory here (saved to the "users" part of data.json).
+# Patents and alerts are NOT kept in memory: the MCP tool inserts them from its own process, so Flask
+# always reads them from the database layer (src/dbControllers).
 USERS = {"user1": {"_id": "user1", "email": "a@b.com", "full_name": "Test User",
                    "fetching_patents": [], "error_patents": []}}
-PATENTS = {}
 
 
 def save():
+    """Save the users. (Only the users: patents and alerts are written by the database layer.)"""
     with _LOCK:
-        with open(DB_FILE, "w") as f:
-            json.dump({"users": USERS, "patents": PATENTS}, f, indent=2, default=str)
+        store.replace_section("users", copy.deepcopy(USERS))
 
 
-# Load saved data AFTER USERS / PATENTS exist
-if os.path.exists(DB_FILE):
-    with open(DB_FILE) as f:
-        _d = json.load(f)
-    USERS.update(_d.get("users", {}))
-    PATENTS.update(_d.get("patents", {}))
+# Load saved users AFTER USERS exists
+USERS.update(store.read_all().get("users", {}))
 
 
 def user_exists(user_id: str) -> bool:
@@ -35,7 +33,11 @@ def user_exists(user_id: str) -> bool:
 
 
 def patent_exists(patent_id: str) -> bool:
-    return patent_id in PATENTS
+    return case_exists(patent_id)
+
+
+def get_patent(patent_id: str):
+    return get_case(patent_id)
 
 
 # ---------------- Create user ----------------
@@ -57,26 +59,35 @@ def create_user(data: dict) -> dict:
     return {"success": True, "message": "User created successfully", "user_id": user_id}
 
 
-# ---------------- Create patent ----------------
+# ---------------- Create patent (manual, from the /api/create-patent route) ----------------
 def create_patent(data: dict, user_id: str) -> dict:
     patent_id = str(data.get("_id") or f"local_{uuid.uuid4().hex[:8]}").strip().upper()
-    if patent_exists(patent_id):
+    result = insert_case({**data, "_id": patent_id, "created_by": user_id})
+    if not result["success"]:
         return {"success": False, "message": "Patent already exists"}
-    PATENTS[patent_id] = {
-        **data,
-        "_id": patent_id,
-        "created_by": user_id,
-        "created_date": dt.now().strftime("%Y-%m-%d"),
-        "analysis_status": "not_started",
-    }
-    save()
     return {"success": True, "message": "Patent created successfully", "case_id": patent_id}
 
 
 # ---------------- Fetch by ID (runs inside the thread) ----------------
+def console_status(patent_id: str, error, message: str = "") -> None:
+    """Print one clear line so the person watching the server console sees the outcome."""
+    when = dt.now().strftime("%H:%M:%S")
+    if error is None:
+        print(f"[{when}] [create-patent] {patent_id} -> CREATED: {message or 'Case created successfully'}",
+              flush=True)
+    else:
+        reason = " ".join(str(error).split())[:300]            # one line, not too long
+        print(f"[{when}] [create-patent] {patent_id} -> NOT CREATED: {reason}", flush=True)
+
+
 def fetch_patent_by_id(app, patent_id: str, user_id: str):
-    
-    """Worker that runs inside the thread. Calls Jinsy's function."""
+    """Worker that runs inside the thread.
+
+    The AI run fetches the patent, and the create_patent MCP tool inserts the case into the database and
+    inserts an alert with the result. This function only tracks progress for the user. The thread is
+    released when this function returns, and the `finally` block guarantees that happens with the
+    "fetching" flag cleared, whatever went wrong.
+    """
     patent_id = patent_id.strip().upper()
 
     # mark as fetching
@@ -86,37 +97,42 @@ def fetch_patent_by_id(app, patent_id: str, user_id: str):
             user["fetching_patents"].append(patent_id)
         save()
 
-    result, error = None, None
+    db, error = {}, None
     try:
         result = parent_patent_info_fetching(app, patent_id, user_id)
-        if result.get("status") == "ERROR":
-            error = result.get("error") or "Fetch tool failed"
-        elif not result.get("validation", {}).get("valid", False):
-            error = "No usable patent details found"
-    except Exception as e:
-        error = str(e)
+        db = result.get("db_insert") or {}
+        if not db.get("success"):
+            error = db.get("message") or "The case was not created"
+    except Exception as e:  # noqa: BLE001 - recorded below, never lost
+        error = f"{type(e).__name__}: {e}"
+    finally:
+        console_status(patent_id, error, db.get("message", ""))
 
-    # store the outcome
-    with _LOCK:
-        patent = PATENTS.setdefault(patent_id, {
-            "_id": patent_id,
-            "created_by": user_id,
-            "created_date": dt.now().strftime("%Y-%m-%d"),
-            "analysis_status": "not_started",
-        })
-        if error is None:
-            patent["fetch_status"] = "fetched"
-            patent["fetched_data"] = result
-            patent.pop("fetch_error", None)
-        else:
-            patent["fetch_status"] = "error"
-            patent["fetch_error"] = error
-            if user and patent_id not in user["error_patents"]:
+        # The tool normally records the alert. If it could not (the run crashed before the tool was called,
+        # or the tool's alert insert failed), record it here so no attempt goes without an alert.
+        if not db.get("alert_id"):
+            try:
+                insert_case_alert(patent_id, user_id, error is None,
+                                  error or db.get("message", ""), "")
+            except Exception as e:  # noqa: BLE001
+                print(f"ERROR: could not save the alert for {patent_id}: {e}", flush=True)
+
+        if error is not None:
+            # keep a record of the failure, but never replace a case that already exists
+            try:
+                insert_case({"_id": patent_id, "created_by": user_id,
+                             "fetch_status": "error", "fetch_error": error})
+            except Exception as e:  # noqa: BLE001
+                print(f"ERROR: could not record the failure for {patent_id}: {e}", flush=True)
+
+        with _LOCK:
+            user = USERS.get(user_id)
+            if user and error is not None and patent_id not in user["error_patents"]:
                 user["error_patents"].append(patent_id)
-
-        if user and patent_id in user["fetching_patents"]:
-            user["fetching_patents"].remove(patent_id)
-        save()
+            if user and patent_id in user["fetching_patents"]:
+                user["fetching_patents"].remove(patent_id)
+            save()
+        # leaving this function ends the thread: it is released
 
 
 def start_fetch_thread(app, patent_id: str, user_id: str):
@@ -137,16 +153,12 @@ def start_fetch_thread(app, patent_id: str, user_id: str):
 # ---------------- Start AI analysis ----------------
 def run_ai_analysis(app, case_id: str):
     with app.app_context():
-        PATENTS[case_id]["analysis_status"] = "running"
+        update_case(case_id, {"analysis_status": "running"})
         try:
             time.sleep(1)  # replace with start_patent_analysis / start_product_analysis
-            PATENTS[case_id]["analysis_status"] = "completed"
-            PATENTS[case_id]["risk_level"] = "low"
+            update_case(case_id, {"analysis_status": "completed", "risk_level": "low"})
         except Exception as e:
-            PATENTS[case_id]["analysis_status"] = "error"
-            PATENTS[case_id]["error"] = str(e)
-        finally:
-            save()
+            update_case(case_id, {"analysis_status": "error", "error": str(e)})
 
 
 def start_analysis_thread(app, case_id: str):
