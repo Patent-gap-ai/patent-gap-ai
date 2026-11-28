@@ -8,7 +8,8 @@ import threading
 import time
 
 from controller import USERS, get_patent, start_fetch_thread
-from src import mongoDB as store
+from memory.mongoDb import connect_to_database, getDataByKeyValue
+from src.envController import getAlertDatabaseName
 
 PID = (sys.argv[1] if len(sys.argv) > 1 else "US20240012345A1").strip().upper()
 
@@ -30,6 +31,5 @@ print("has fetched_data:", "fetched_data" in p)
 print("fetching list   :", USERS["user1"]["fetching_patents"])
 print("error list      :", USERS["user1"]["error_patents"])
 print("\nalerts for this case:")
-for a in store.read_all().get("alerts", {}).values():
-    if a["triggered_by"] == PID:
-        print("  -", a["title"], "|", a["description"][:120])
+for a in getDataByKeyValue(connect_to_database(), getAlertDatabaseName() or "alerts", "triggered_by", PID):
+    print("  -", a["title"], "|", a["description"][:120])

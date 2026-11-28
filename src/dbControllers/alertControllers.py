@@ -1,8 +1,6 @@
-"""Database functions for alerts. Used by the MCP tool create_patent and by controller.py.
+"""Database functions for alerts, now backed by MongoDB (src/database.py).
 
 The alert document has the same fields as _save_alert() in src/mcp_tools/alerts.py.
-Right now it is stored in the temporary local store. When MongoDB is ready, rewrite the body of
-insert_alert() (e.g. addDataById(connect_to_database(), getAlertDatabaseName(), alert)) and keep its signature.
 """
 from __future__ import annotations
 
@@ -10,9 +8,13 @@ import time
 from datetime import datetime
 from typing import Any
 
-from memory import mongoDb as store
+from memory.mongoDb import addDataById, connect_to_database
+from src.envController import getAlertDatabaseName
 
-COLLECTION = "alerts"
+
+def _collection() -> str:
+    # ALERT_DATABASE_NAME_<DEV|PROD|TEST> in .env; falls back to "alerts" if it is not set.
+    return getAlertDatabaseName() or "alerts"
 
 
 def insert_alert(triggered_by: str, alert_users: list[str], title: str, description: str) -> str:
@@ -25,15 +27,18 @@ def insert_alert(triggered_by: str, alert_users: list[str], title: str, descript
             "description": description,
             "triggered_by": triggered_by,                     # the case id (= the patent id)
             "triggered_at": datetime.now().strftime("%Y-%m-%d"),
+            "last_updated": datetime.now(),
             "alert_users": list(alert_users),
             "opened_receipts": [],
             "sent_receipts": [],
         }
-        try:
-            store.insert(COLLECTION, alert)
-            return alert["_id"]
-        except store.DuplicateKeyError:                       # same millisecond (maybe from another process)
-            alert_id += 1
+        added = addDataById(connect_to_database(), _collection(), alert)
+        if added == alert["_id"]:
+            return added
+        if "E11000" in str(added) or "duplicate key" in str(added).lower():
+            alert_id += 1                                     # same millisecond (maybe another process)
+            continue
+        raise RuntimeError(f"MongoDB insert of alert failed: {added}")
 
 
 def insert_case_alert(case_id: str, user_id: str, success: bool, message: str, sources: str = "") -> str:

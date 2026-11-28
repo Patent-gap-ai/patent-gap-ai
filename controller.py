@@ -5,27 +5,35 @@ import threading
 from datetime import datetime as dt
 
 from main import parent_patent_info_fetching   # Jinsy's function
-from memory import mongoDb as store
+from memory.mongoDb import connect_to_database, getAllData, insertOrUpdateDataById
+from src.envController import getUserDatabaseName
 from src.dbControllers.caseControllers import case_exists, get_case, insert_case, update_case
 from src.dbControllers.alertControllers import insert_case_alert
 
 _LOCK = threading.RLock()
 
-# Users still live in memory here (saved to the "users" part of data.json).
+# Users are kept in memory here and saved to the MongoDB users collection by save().
 # Patents and alerts are NOT kept in memory: the MCP tool inserts them from its own process, so Flask
 # always reads them from the database layer (src/dbControllers).
 USERS = {"user1": {"_id": "user1", "email": "a@b.com", "full_name": "Test User",
                    "fetching_patents": [], "error_patents": []}}
 
 
+def _users_collection() -> str:
+    # USERS_DATABASE_NAME_<DEV|PROD|TEST> in .env; falls back to "users" if it is not set.
+    return getUserDatabaseName() or "users"
+
+
 def save():
-    """Save the users. (Only the users: patents and alerts are written by the database layer.)"""
+    """Save the users to MongoDB (one upsert per user). Patents and alerts are written by dbControllers."""
     with _LOCK:
-        store.replace_section("users", copy.deepcopy(USERS))
+        db = connect_to_database()
+        for user in copy.deepcopy(list(USERS.values())):
+            insertOrUpdateDataById(db, _users_collection(), user)
 
 
 # Load saved users AFTER USERS exists
-USERS.update(store.read_all().get("users", {}))
+USERS.update({u["_id"]: u for u in getAllData(connect_to_database(), _users_collection())})
 
 
 def user_exists(user_id: str) -> bool:

@@ -1,82 +1,562 @@
-"""TEMPORARY local-file database, shared by the Flask app and the MCP server process.
-
-Why it exists: the real MongoDB layer (src/database.py) is not written yet. The MCP tool runs in its own
-process, so it cannot share Python dictionaries with Flask. Both processes therefore read and write the
-same file (data.json), one small locked transaction at a time:  lock -> read -> change -> write -> unlock.
-Nobody keeps their own copy of patents or alerts in memory, so nobody can overwrite anybody else's insert.
-
-Collections are top-level keys of data.json:  "users", "patents", "alerts".
-When MongoDB is ready, only the functions in src/dbControllers/*.py need to change. This file can go.
-"""
-from __future__ import annotations
-
-import json
 import os
-from pathlib import Path
-from typing import Any, Callable
+import uuid
+from datetime import datetime
+from google.cloud import storage
+from pymongo import MongoClient
+from typing import Optional, Dict, Any, List
 
-from filelock import FileLock
+from src.envController import getDatabaseConnectionString
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-DATA_FILE = Path(os.environ.get("PATENT_GAP_DATA_FILE") or ROOT_DIR / "data.json")
-_LOCK = FileLock(str(DATA_FILE) + ".lock", timeout=30)      # works across processes (and Windows/macOS/Linux)
+# Module-level variable to store MongoDB database instance
+_mongodb_client = None
+_mongodb_db = None
+PAGE_SIZE = 10
 
+def connect_to_database():
+    """
+    Connects to Database using MongoDB connection string from environment variables.
+    Returns the MongoDB database client.
+    
+    The connection string should be in the format:
+    mongodb://<username>:<password>@<host>:<port>/<database>?<options>
+    
+    Returns:
+        Database: MongoDB database instance for the 'patent-gap' database
+        
+    Raises:
+        ValueError: If MONGODB_CONNECTION_STRING is not set in .env file
+    """
+    global _mongodb_client, _mongodb_db
 
-class DuplicateKeyError(Exception):
-    """A document with this _id already exists in the collection."""
+    # Get MongoDB connection string from environment
+    connection_string = getDatabaseConnectionString()
+    # print('\nConnection String: ', connection_string)
+    db_name = 'patent_gap'  # Default, or extract from connection string
+    
+    if not connection_string:
+        raise ValueError("MONGODB_CONNECTION_STRING must be set in .env file.")
+    
+    # Connect if not already connected
+    if _mongodb_client is None:
+        try:
+            _mongodb_client = MongoClient(connection_string)
+            # Test the connection
+            _mongodb_client.admin.command('ping')
 
+            # Get the database (database name is typically in the connection string)
+            # Extract database name from connection string or use default
+            _mongodb_db = _mongodb_client[db_name]
+            # print('\nDatabase: ', _mongodb_db)
+        except Exception as e:
+            print(f'\nERROR: Failed to connect to MongoDB/Firestore for database {db_name}: ', str(e))
+            raise ConnectionError(f"Failed to connect to MongoDB/Firestore for database {db_name}: {e}")
+    
+    return _mongodb_db
 
-def _read() -> dict[str, Any]:
-    if not DATA_FILE.exists():
-        return {}
-    text = DATA_FILE.read_text(encoding="utf-8")
-    return json.loads(text) if text.strip() else {}
+def getCollectionsFromDatabase(db):
+    """
+    Fetches all collections from a MongoDB database.
+    
+    Args:
+        db: MongoDB database instance (from connect_to_database())
+        
+    Returns:
+        list: List of all collections in the database.
+    """
+    try:
+        # print('\nDb : ', db)
+        collections = db.list_collection_names()
+        return collections
+    except Exception as e:
+        print(f"Error fetching collections from database: {e}")
+        return []
 
+def checkCollectionExists(db, collectionName):
+    """
+    Checks if a collection exists in a MongoDB database.
+    
+    Args:
+        db: MongoDB database instance (from connect_to_database())
+        collectionName (str): The name of the collection to check.
+    """
+    try:
+        return collectionName in getCollectionsFromDatabase(db)
+    except Exception as e:
+        print(f'\nERROR: Unable to check collection {collectionName} in database: ', str(e))
+    return None
 
-def _write(data: dict[str, Any]) -> None:
-    tmp = DATA_FILE.with_name(DATA_FILE.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
-    os.replace(tmp, DATA_FILE)                               # atomic: readers never see a half-written file
+def createCollection(db, collectionName):
+    """
+    Creates a new collection in a MongoDB database.
+    
+    Args:
+        db: MongoDB database instance (from connect_to_database())
+        collectionName (str): The name of the collection to create.
+    """
+    try:
+        collection = db.create_collection(collectionName)
+        return collection
+    except Exception as e:
+        print(f"\nERROR: Error creating collection {collectionName}: {e}")
+        return None
 
+def getAllData(db, collectionName):
+    """
+    Fetches all data from a specified Firestore collection.
+    
+    Args:
+        db: MongoDB database instance (from connect_to_database())
+        collectionName (str): The name of the collection to fetch.
+        
+    Returns:
+        list: List of all documents in the collection, or empty list if collection doesn't exist.
+    """
+    try:
+        collection = db[collectionName]
+        # Convert ObjectId to string for JSON serialization
+        documents = list(collection.find({}, max_time_ms=120000))
+        # Convert _id from ObjectId to string if present
+        for doc in documents:
+            if '_id' in doc and hasattr(doc['_id'], '__str__'):
+                doc['_id'] = str(doc['_id'])
+        return documents
+    except Exception as e:
+        print(f"Error fetching all data from {collectionName}: {e}")
+        return []
 
-def transaction(change: Callable[[dict[str, Any]], Any]) -> Any:
-    """Run change(data) while holding the lock, then save. If change() raises, nothing is saved."""
-    with _LOCK:
-        data = _read()
-        result = change(data)
-        _write(data)
-        return result
+def deleteAllData(db, collectionName):
+    """
+    Deletes all data from a specified Firestore collection.
+    
+    Args:
+        db: MongoDB database instance (from connect_to_database())
+        collectionName (str): The name of the collection to delete.
+    """
+    try:
+        return db[collectionName].delete_many({})
+    except Exception as e:
+        print(f"Error deleting all data from {collectionName}: {e}")
+        return False
 
+def getDataById(db, collectionName, entryId):
+    """
+    Fetches a specific entry by ID from a MongoDB collection.
 
-def read_all() -> dict[str, Any]:
-    with _LOCK:
-        return _read()
+    Looks up ``_id`` first, then a targeted ``id`` field match.
+    Does not scan the full collection on miss.
+    
+    Args:
+        db: MongoDB database instance (from connect_to_database())
+        collectionName (str): The name of the collection to fetch from.
+        entryId (str): The ID of the entry to retrieve.
+        
+    Returns:
+        dict: The data for the specified entry, or None if not found.
+    """
+    try:
+        collection = db[collectionName]
+        document = collection.find_one({'_id': entryId})
+        if document is None and entryId is not None:
+            document = collection.find_one({'id': entryId})
+        
+        # Convert ObjectId to string if present
+        if document and '_id' in document and hasattr(document['_id'], '__str__'):
+            document['_id'] = str(document['_id'])
+        
+        return document
+    except Exception as e:
+        print(f"Error fetching data by ID from {collectionName}: {e}")
+        return None
 
+def getDataContainingIdString(db, collectionName, idString):
+    try:
+        collection = db[collectionName]
+        documents = list(collection.find({'_id': {'$regex': idString}}, max_time_ms=120000))
+        for doc in documents:
+            if '_id' in doc and hasattr(doc['_id'], '__str__'):
+                doc['_id'] = str(doc['_id'])
+        return documents
+    except Exception as e:
+        print(f"Error fetching data containing ID string from {collectionName}: {e}")
+        return []
 
-def insert(collection: str, doc: dict[str, Any]) -> None:
-    """Add one document. Raises DuplicateKeyError if its _id is already taken."""
-    def _do(data: dict[str, Any]) -> None:
-        section = data.setdefault(collection, {})
-        if doc["_id"] in section:
-            raise DuplicateKeyError(f"{collection}/{doc['_id']} already exists")
-        section[doc["_id"]] = doc
-    transaction(_do)
+def getDataByKeyValue(db, collectionName, key, value, exclude_fields=None):
+    """
+    Fetch documents matching ``{key: value}``.
 
+    Args:
+        exclude_fields: Optional iterable of field names to exclude from the
+            result via a MongoDB projection (e.g. ``['file_content']``).
+            ``None`` or an empty list keeps current full-document behavior.
+    """
+    try:
+        collection = db[collectionName]
+        projection = None
+        if exclude_fields:
+            projection = {field: 0 for field in exclude_fields}
+        documents = list(collection.find({key: value}, projection, max_time_ms=120000))
+        for doc in documents:
+            if '_id' in doc and hasattr(doc['_id'], '__str__'):
+                doc['_id'] = str(doc['_id'])
+        return documents
+    except Exception as e:
+        print(f"Error fetching data by key and value from {collectionName}: {e}")
+        return []
 
-def get(collection: str, doc_id: str) -> dict[str, Any] | None:
-    return read_all().get(collection, {}).get(doc_id)
+def getDataByQuery(db, collectionName, query, exclude_fields=None, include_fields=None):
+    """
+    Fetch documents matching an arbitrary Mongo ``query``.
 
+    Args:
+        exclude_fields: Optional field names to omit (``{field: 0}``).
+        include_fields: Optional field names to keep (``{field: 1}``).
+            If both are set, inclusion wins.
+    """
+    try:
+        collection = db[collectionName]
+        projection = None
+        if include_fields:
+            projection = {field: 1 for field in include_fields}
+        elif exclude_fields:
+            projection = {field: 0 for field in exclude_fields}
+        documents = list(collection.find(query or {}, projection, max_time_ms=120000))
+        for doc in documents:
+            if '_id' in doc and hasattr(doc['_id'], '__str__'):
+                doc['_id'] = str(doc['_id'])
+        return documents
+    except Exception as e:
+        print(f"Error fetching data by query from {collectionName}: {e}")
+        return []
 
-def update_fields(collection: str, doc_id: str, fields: dict[str, Any]) -> bool:
-    """Change some fields of an existing document. Returns False if it does not exist."""
-    def _do(data: dict[str, Any]) -> bool:
-        doc = data.get(collection, {}).get(doc_id)
-        if doc is None:
-            return False
-        doc.update(fields)
-        return True
-    return transaction(_do)
+def getDataByKeyValueRegex(db, collectionName, key, value):
+    try:
+        collection = db[collectionName]
+        documents = list(collection.find({key: {'$regex': value}}, max_time_ms=120000))
+        for doc in documents:
+            if '_id' in doc and hasattr(doc['_id'], '__str__'):
+                doc['_id'] = str(doc['_id'])
+        return documents
+    except Exception as e:
+        print(f"Error fetching data by key and value from {collectionName}: {e}")
+        return []
 
+def paginateDataByQuery(
+    db,
+    collectionName,
+    query=None,
+    page=1,
+    sort_field='last_updated',
+    sort_direction=-1
+):
+    """
+    Returns a fixed-size page (PAGE_SIZE) of documents and pagination metadata.
+    """
+    try:
+        collection = db[collectionName]
+        query = query or {}
+        page = max(int(page or 1), 1)
+        skip = (page - 1) * PAGE_SIZE
 
-def replace_section(collection: str, content: dict[str, Any]) -> None:
-    transaction(lambda data: data.__setitem__(collection, content))
+        total = collection.count_documents(query, maxTimeMS=120000)
+        cursor = collection.find(query, max_time_ms=120000)
+
+        # Fall back to _id sort if selected field is missing on many docs.
+        try:
+            cursor = cursor.sort(sort_field, sort_direction)
+        except Exception:
+            cursor = cursor.sort('_id', -1)
+
+        documents = list(cursor.skip(skip).limit(PAGE_SIZE))
+        for doc in documents:
+            if '_id' in doc and hasattr(doc['_id'], '__str__'):
+                doc['_id'] = str(doc['_id'])
+
+        total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE if total > 0 else 0
+        return {
+            'items': documents,
+            'pagination': {
+                'page': page,
+                'page_size': PAGE_SIZE,
+                'total': total,
+                'total_pages': total_pages,
+                'has_next': page < total_pages
+            }
+        }
+    except Exception as e:
+        print(f"Error paginating data from {collectionName}: {e}")
+        return {
+            'items': [],
+            'pagination': {
+                'page': max(int(page or 1), 1),
+                'page_size': PAGE_SIZE,
+                'total': 0,
+                'total_pages': 0,
+                'has_next': False
+            }
+        }
+
+def searchDataForKeywords(db, collectionName, key, value, keywords, page=1):
+    """
+    Search documents that match key:value and contain keyword(s) in any indexed field.
+    Returns paginated data with fixed PAGE_SIZE.
+    """
+    try:
+        collection = db[collectionName]
+        page = max(int(page or 1), 1)
+        skip = (page - 1) * PAGE_SIZE
+
+        if isinstance(keywords, str):
+            keywords = [keywords]
+        keywords = [kw.strip() for kw in (keywords or []) if isinstance(kw, str) and kw.strip()]
+
+        if not keywords:
+            return paginateDataByQuery(db, collectionName, query={key: value}, page=page)
+
+        total_pipeline = [
+            {
+                "$search": {
+                    "index": "default",
+                    "compound": {
+                        "filter": [{"equals": {"path": key, "value": value}}],
+                        "should": [
+                            {"text": {"query": kw, "path": {"wildcard": "*"}}}
+                            for kw in keywords
+                        ],
+                        "minimumShouldMatch": 1,
+                    },
+                    "count": {"type": "total"},
+                }
+            },
+            {"$limit": 1},
+            {"$project": {"_id": 0, "count": "$$SEARCH_META.count.total"}}
+        ]
+        pipeline = [
+            {
+                "$search": {
+                    "index": "default",
+                    "compound": {
+                        "filter": [{"equals": {"path": key, "value": value}}],
+                        "should": [
+                            {"text": {"query": kw, "path": {"wildcard": "*"}}}
+                            for kw in keywords
+                        ],
+                        "minimumShouldMatch": 1,
+                    },
+                }
+            },
+            {"$sort": {"last_updated": -1, "_id": -1}},
+            {"$skip": skip},
+            {"$limit": PAGE_SIZE},
+        ]
+
+        total_result = list(collection.aggregate(total_pipeline, maxTimeMS=120000))
+        total = int(total_result[0].get('count', 0)) if total_result else 0
+        documents = list(collection.aggregate(pipeline))
+        for doc in documents:
+            if "_id" in doc and hasattr(doc["_id"], "__str__"):
+                doc["_id"] = str(doc["_id"])
+
+        total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE if total > 0 else 0
+        return {
+            'items': documents,
+            'pagination': {
+                'page': page,
+                'page_size': PAGE_SIZE,
+                'total': total,
+                'total_pages': total_pages,
+                'has_next': page < total_pages
+            }
+        }
+    except Exception as atlas_error:
+        print(f"Atlas Search failed in {collectionName}: {atlas_error}")
+        return {
+            'items': [],
+            'pagination': {
+                'page': max(int(page or 1), 1),
+                'page_size': PAGE_SIZE,
+                'total': 0,
+                'total_pages': 0,
+                'has_next': False
+            }
+        }
+
+def updateListByIdAndKey(db, collectionName, update_list, entry_id, key):
+    """
+    Updates a specific entry in a Firestore collection by its ID and key.
+    """
+    try:
+        collection = db[collectionName]
+        result = collection.update_one(
+            {'_id': entry_id},
+            {'$push': {key: {'$each': update_list}}, '$set': {'last_updated': datetime.now()}}
+        )
+        return result.modified_count > 0
+    except Exception as e:
+        print(f"Error updating list by ID and key in {collectionName}: {e}")
+        return False
+
+def updateDataById(db, collectionName, update_fields, entry_id):
+    """
+    Updates a specific entry in a Firestore collection by its ID.
+    
+    Args:
+        db: MongoDB database instance (from connect_to_database())
+        collectionName (str): The name of the collection to update.
+        entryData (dict): The data to update, must include the entry's '_id' key.
+        
+    Returns:
+        bool: True if update was successful, False otherwise.
+    """
+    try:
+        collection = db[collectionName]
+        update_fields['last_updated'] = datetime.now()
+        result = collection.update_one(
+            {'_id': entry_id},
+            {'$set': update_fields}
+        )
+        return result.modified_count > 0
+    except Exception as e:
+        print(f"Error updating data by ID in {collectionName}: {e}")
+        return False
+
+def deleteDataById(db, collectionName, entryId):
+    """
+    Deletes a specific entry by ID from a Firestore collection.
+    
+    Args:
+        db: MongoDB database instance (from connect_to_database())
+        collectionName (str): The name of the collection to delete from.
+        entryId (str): The ID of the entry to delete.
+        
+    Returns:
+        bool: True if deletion was successful, False otherwise.
+    """
+    try:
+        collection = db[collectionName]
+        result = collection.delete_one({'_id': entryId})
+        return result.deleted_count > 0
+    except Exception as e:
+        print(f"Error deleting data by ID from {collectionName}: {e}")
+        return False
+
+def addDataById(db, collectionName, entryData):
+    """
+    Adds a new entry to a MongoDB collection.
+    If '_id' is provided in entryData, uses that; otherwise MongoDB generates one.
+    If entry data already exists under different '_id', one of the following happens:
+    - if all the keys and values are the same, do nothing
+    - if any key which didn't exist (or was None/empty) has a new value, update the existing entry with the new value
+    
+    Args:
+        db: MongoDB database instance (from connect_to_database())
+        collectionName (str): The name of the collection to add to.
+        entryData (dict): The data to insert. May include '_id' to specify the document ID.
+        
+    Returns:
+        str: The inserted document ID (as string)
+    """
+    try:
+        if not checkCollectionExists(db, collectionName):
+            createCollection(db, collectionName)
+        collection = db[collectionName]
+        # allData = getAllData(db, collectionName)
+        if '_id' not in entryData.keys():
+            entryData['_id'] = str(uuid.uuid4())
+        result = collection.insert_one(entryData)
+        return str(result.inserted_id)
+    except Exception as e:
+        print(f"Error adding data to {collectionName}: {e}")
+        return "DocumentCreationError: Collection(" + collectionName + ") not found: " + str(e)
+
+def insertOrUpdateDataById(db, collectionName, entryData):
+    """
+    Inserts a new document or updates if it already exists (upsert operation).
+    
+    Args:
+        db: MongoDB database instance (from connect_to_database())
+        collectionName (str): The name of the collection.
+        entryData (dict): The data to insert/update, must include '_id' key.
+        
+    Returns:
+        str: The document ID
+    """
+    try:
+        if not checkCollectionExists(db, collectionName):
+            createCollection(db, collectionName)
+        entry_id = entryData.get('_id')
+        if not entry_id:
+            raise ValueError("entryData must include an '_id' key.")
+        
+        collection = db[collectionName]
+        entryData['last_updated'] = datetime.now()
+        collection.replace_one(
+            {'_id': entry_id},
+            entryData,
+            upsert=True  # Insert if doesn't exist, update if it does
+        )
+        return str(entry_id)
+    except Exception as e:
+        print(f"Error inserting/updating data in {collectionName}: {e}")
+        return None
+
+def connect_to_bucket(bucketName):
+    """
+    Connects to a Google Cloud Storage bucket and returns the bucket instance.
+
+    Args:
+        bucketName (str): The name of the GCP bucket to connect to.
+
+    Returns:
+        google.cloud.storage.bucket.Bucket: The bucket instance.
+    """
+    # Assumes GOOGLE_APPLICATION_CREDENTIALS is set in the environment
+    client = storage.Client()
+    bucket = client.bucket(bucketName)
+    return bucket
+
+def uploadToGcpBucket(bucketName, sourceFile, destinationBlob):
+    """
+    Uploads a file to a Google Cloud Storage bucket.
+
+    Args:
+        bucketName (str): The name of the GCP bucket.
+        sourceFile (str): The local path to the file to upload.
+        destinationBlob (str): The destination path (blob name) in the bucket.
+
+    Returns:
+        bool: True if upload was successful, False otherwise.
+    """
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucketName)
+        blob = bucket.blob(destinationBlob)
+        blob.upload_from_filename(sourceFile)
+        # Return the URL to the file as 'bucket-name/file-name'
+        return f"{bucketName}/{destinationBlob}"
+    except Exception as e:
+        print(f"Error uploading file to bucket: {e}")
+        return None
+
+def loadFromGcpBucket(bucketName, fileName):
+    """
+    Loads a specific file from a Google Cloud Storage bucket into memory.
+
+    Args:
+        bucketName (str): The name of the GCP bucket.
+        fileName (str): The name/path of the file (blob) in the bucket.
+
+    Returns:
+        bytes: The file content as bytes if successful, None otherwise.
+    """
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucketName)
+        blob = bucket.blob(fileName)
+        if not blob.exists():
+            print(f"File '{fileName}' does not exist in bucket '{bucketName}'.")
+            return None
+        file_content = blob.download_as_bytes()
+        return file_content
+    except Exception as e:
+        print(f"Error loading file from bucket: {e}")
+        return None

@@ -1,6 +1,6 @@
 {
   "patent_id": "US20240012345A1",
-  "fetched_at": "2026-11-27T11:57:34.575317+00:00",
+  "fetched_at": "2026-11-28T12:25:25.382324+00:00",
   "sources": {
     "uspto": null,
     "google_patents": {
@@ -41,6 +41,6 @@
     "success": true,
     "message": "Case US20240012345A1 created successfully",
     "case_id": "US20240012345A1",
-    "alert_id": "1795780654631"
+    "alert_id": "1795868727960"
   }
 }
